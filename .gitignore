@@ -1,0 +1,10 @@
+# 运行时配置由 Runner 自动生成，不入库
+/config.toml
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+data/
+*.db
+*.log
