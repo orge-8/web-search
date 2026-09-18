@@ -109,7 +109,8 @@ web_search(query)
 | 配置项 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | 是否 LLM 总结（关闭则直接返回材料片段） |
-| `task` | `replyer` | **模型任务名**，不是模型 ID。可选值用 `/websearch status` 查看 |
+| `task` | `replyer` | **模型任务名**（如 `replyer` / `planner` / `utils`），不是模型 ID。可选值用 `/websearch status` 查看 |
+| `model` | 空 | **具体模型名**（如 `gpt-4o-mini`）。留空即用任务默认模型；需 SDK ≥2.8.1，且填任务名会被自动忽略并告警 |
 | `temperature` | `0.3` | 总结温度 |
 | `max_tokens` | `1200` | 输出上限 |
 | `rpc_timeout_ms` | `120000` | LLM 调用的 RPC 超时（毫秒）。Host 默认 30~60 秒，长材料会被截断，故显式放宽 |
@@ -117,6 +118,11 @@ web_search(query)
 
 > ⚠️ `task` 不能留空。留空时 Host 会用 `plugin.<插件ID>` 作为任务名，
 > 该任务未配置会回退到 embedding 模型并持续报 400。
+>
+> ⚠️ `task` 与 `model` 是**两个不同的槽位**，别填串。MaiBot 1.2.5 / SDK 2.8.1 起
+> `task_name` 收任务名、`model` 收具体模型名；把任务名填进 `model` 会得到
+> `未找到名为 'utils' 的模型`。v0.3.6 起插件会自动忽略误填值并告警，
+> 但仍建议按语义填对。
 
 ### `[cache]`
 
@@ -220,6 +226,8 @@ search_image(query, count=0)
 | 搜索成功但没有正文 | 目标站点反爬或需登录。可降低 `fetch.max_pages`、在 `search.order` 追加 tavily（自带正文），或接受只用摘要 |
 | 正文抓到一堆导航文字 | 站点结构特殊，启发式提取失效。可关闭 `fetch.enabled` 退化为摘要模式，或提 issue 附上 URL |
 | 总结报 400 或刷 embedding 相关错误 | `summarize.task` 配错或留空。跑 `/websearch status` 看"可用模型任务名"，改成列表中的值 |
+| 报 `未找到名为 'xxx' 的模型` | **任务名被填进了模型名槽位**（`summarize.model`），或 `summarize.task` 里填了模型 ID。任务名走 `task`、具体模型名走 `model`，`model` 留空即用任务默认模型。v0.3.6 起误填值会被自动忽略并告警，`/websearch status` 里能看到"已停用的 LLM 参数" |
+| 改完模型配置后总结仍失败 | 自愈状态按会话生效。确认 `/websearch status` 里没有"已停用的 LLM 参数"，否则热重载插件或重启 MaiBot 复位 |
 | 总结超时 | 加大 `summarize.rpc_timeout_ms`，或减小 `fetch.max_pages` / `fetch.total_chars` 降低材料量 |
 | 每次搜索都慢十几秒 | 某个引擎连接超时。检查 `engine_cooldown` 是否被设为 0，或把慢引擎从 `order` 里移除 |
 | 图片搜不到 / 提示图片搜索失败 | 百度图片风控或关键词过冷。换常见关键词重试；`/websearch status` 确认"图片搜索：开" |
@@ -236,6 +244,7 @@ search_image(query, count=0)
 python check_plugin.py --plugin .
 python tests/smoke_test.py          # 生命周期 + 三条主链路（离线）
 python tests/test_pipeline.py       # 42 项离线单测
+python tests/test_llm_params.py     # LLM 传参：任务名/模型名槽位（54 项断言）
 python -m pytest -q tests           # 同上（pytest 风格）
 
 # 联网探测（在目标机器上跑，确认引擎与抓取可用）
@@ -246,6 +255,11 @@ SEARXNG_BASE_URL=https://... TAVILY_API_KEY=... python tests/network_probe.py
 测试设计说明：`smoke_test.py` 与 `test_pipeline.py` **完全离线且确定性**——
 外部引擎与抓取器被 stub 替换，因此不会因为网络抖动误报。网络可用性交给
 `network_probe.py` 单独验证，这样"代码坏了"和"网不通"能被区分开。
+
+`test_llm_params.py` 给插件注入一个假的 `ctx.llm`，直接断言插件**实际传出的
+kwargs**（不是读配置），因此新语义（SDK ≥2.8.1）与旧语义（≤2.8.0）两条路径
+在任意环境都能验证。这一点很关键：本地 venv 若是 2.8.0，走真实 SDK 只能看到
+旧语义，会把真机那条路径漏掉。
 
 ## 设计取舍
 

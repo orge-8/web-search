@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "org.orge-8.web-search",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "name": "联网搜索 (Web Search)",
   "description": "让麦麦可以联网查资料：多引擎降级搜索（百度 / Bing / DuckDuckGo / SearXNG / Tavily，失败或结果与查询明显不符即自动换下一个）→ 抓取结果页正文（自动解开跳转链接）→ LLM 阅读后生成带来源引用的答案，结果可疑时会给 LLM 改查建议。另提供 fetch_page 工具抓取指定 URL 正文、search_image 工具搜索图片并直接发送到聊天（SSRF 校验 + 重定向逐跳校验 + 魔数校验 + 体积上限，下载失败自动换图），/websearch 命令用于诊断引擎链路与查看缓存状态。所有外调均有超时、冷却与 SSRF 防护。",
   "author": {

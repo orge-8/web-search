@@ -13,6 +13,15 @@ from .extract import extract_main_text, html_to_text
 from .fetcher import FetchOutcome, Fetcher, is_safe_url
 from .image_download import ImageDownload, ImageDownloader
 from .image_search import BaiduImageEngine, ImageResult, parse_acjson
+from .llm_params import (
+    KNOWN_TASK_NAMES,
+    build_llm_kwargs,
+    describe_kwargs,
+    explain_missing_model,
+    generate_supports_task_name,
+    needs_task_list_lookup,
+    rejected_model_name,
+)
 from .models import SearchResult
 from .relevance import extract_terms, is_low_relevance, relevance_ratio
 
@@ -30,6 +39,13 @@ __all__ = [
     "BaiduImageEngine",
     "ImageResult",
     "parse_acjson",
+    "KNOWN_TASK_NAMES",
+    "build_llm_kwargs",
+    "describe_kwargs",
+    "explain_missing_model",
+    "generate_supports_task_name",
+    "needs_task_list_lookup",
+    "rejected_model_name",
     "SearchResult",
     "extract_terms",
     "is_low_relevance",

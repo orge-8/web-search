@@ -11,8 +11,11 @@
   * **正文提取自己写**：见 ``core/extract.py`` 的启发式规则。
   * **引擎可降级**：Google 在多数国内网络不可达，所以默认链是
     duckduckgo → bing，Tavily 作为配了 Key 之后的追加项。
-  * **LLM 任务名必须显式传**：留空会让 Host 用 ``plugin.<插件ID>`` 当任务名，
-    该任务未配置时会 fallback 到 embedding 模型并持续报 400。
+  * **LLM 任务名与模型名分开传**：Host 1.2.5 / SDK 2.8.1 起 ``task_name``（任务名）
+    与 ``model``（具体模型名）语义拆分。任务名必须显式传——留空会让 Host 用
+    ``plugin.<插件ID>`` 当任务名，该任务未配置时会 fallback 到 embedding 模型并持续
+    报 400；而把任务名塞进 ``model`` 槽位，则会得到「未找到名为 'utils' 的模型」。
+    传参构造见 ``core/llm_params.py``。
 """
 
 import asyncio
@@ -31,15 +34,28 @@ from .core.engines import EngineChain, build_engine_chain, supported_engine_name
 from .core.fetcher import Fetcher
 from .core.image_download import ImageDownloader
 from .core.image_search import BaiduImageEngine, ImageResult
+from .core.llm_params import (
+    build_llm_kwargs,
+    describe_kwargs,
+    explain_missing_model,
+    generate_supports_task_name,
+    needs_task_list_lookup,
+    rejected_model_name,
+)
 from .core.models import SearchResult
 from .core.relevance import describe, is_low_relevance, relevance_ratio
 
-SUPPORTED_CONFIG_VERSION = "0.3.5"  # 与 _manifest.json 的 version 保持同步
+SUPPORTED_CONFIG_VERSION = "0.3.6"  # 与 _manifest.json 的 version 保持同步
 
 # 行为自检标记：真机"看起来部署了却没生效"时（依赖模块命中 sys.modules 缓存），
 # 用 /websearch status 显示的这些值即可判断跑的是不是新代码。
-BUILD_TAG = "2026-09-12.hop-check"
+BUILD_TAG = "2026-09-17.llm-param-split"
 EXTRACTOR_TAG = "heuristic-v1"
+
+#: Host 可用任务名清单的缓存时长。总结每次搜索都调一次 LLM，不加缓存就是每查一次多一次 RPC。
+_TASK_NAMES_TTL_SECONDS = 60.0
+#: 取清单的超时。Host RPC 无内建超时，诊断类调用卡住会把总结流程一起拖死。
+_TASK_NAMES_TIMEOUT_SECONDS = 8.0
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -155,7 +171,17 @@ class SummarizeSectionConfig(PluginConfigBase):
     enabled: bool = Field(default=True, description="是否让 LLM 阅读材料后总结（关闭则直接返回材料片段）")
     task: str = Field(
         default="replyer",
-        description="调用的模型任务名，如 replyer / planner / utils。留空会导致 Host 回退到 embedding 模型并报错",
+        description=(
+            "模型任务名（填任务，不是模型 ID），如 replyer / planner / utils。"
+            "留空会导致 Host 回退到 embedding 模型并报错"
+        ),
+    )
+    model: str = Field(
+        default="",
+        description=(
+            "可选：具体模型名（需 SDK ≥2.8.1）。留空即用任务默认模型；"
+            "填任务名会被自动忽略并告警"
+        ),
     )
     temperature: float = Field(default=0.3, description="总结温度")
     max_tokens: int = Field(default=1200, description="总结输出上限 token")
@@ -261,6 +287,17 @@ class WebSearchPlugin(MaiBotPlugin):
         self._image_sent_history: dict[str, tuple[set[str], float]] = {}
         self._last_error: str = ""
         self._started_at: float = 0.0
+        # --- LLM 传参自愈状态（见 core/llm_params.py）---
+        # 「任务名被填进模型名槽位」属于**配置性**错误，重试不会自愈；正确做法是
+        # 调用前纠偏一次，并把被拒的参数在本次会话内停用，别让每个请求都白跑一遍。
+        # 这些位不写回 config.toml，且在 on_config_update 里复位，保证用户改完配置即刻生效。
+        self._llm_ignore_model: bool = False
+        self._llm_ignore_task: bool = False
+        self._llm_notice_reported: bool = False
+        # Host 可用任务名清单缓存 (monotonic 时刻, 清单)；取失败不写缓存。
+        self._llm_task_names_cache: tuple[float, list[str]] | None = None
+        # generate 是否支持 task_name（None = 尚未探测）。
+        self._llm_supports_task_name: bool | None = None
 
     # ------------------------------------------------------------------ 辅助
 
@@ -466,33 +503,142 @@ class WebSearchPlugin(MaiBotPlugin):
         lines = [item.to_source_line(index) for index, item in enumerate(results, start=1)]
         return "\n".join(lines)
 
+    async def _available_task_names(self) -> list[str]:
+        """取 Host 可用任务名清单（60s 缓存 + 超时保护），取不到返回空列表。
+
+        只在「疑似把任务名填进了模型名槽位」时才会被调用，正常配置不产生额外 RPC。
+        """
+        now = time.monotonic()
+        cached = self._llm_task_names_cache
+        if cached is not None and now - cached[0] < _TASK_NAMES_TTL_SECONDS:
+            return cached[1]
+
+        try:
+            names = [
+                str(name)
+                for name in await asyncio.wait_for(
+                    self.ctx.llm.get_available_models(),
+                    timeout=_TASK_NAMES_TIMEOUT_SECONDS,
+                )
+            ]
+        except Exception as exc:  # 取不到清单只是失去纠偏依据，不影响正常调用
+            self._debug("获取可用任务名失败：%s", exc)
+            return []
+
+        self._llm_task_names_cache = (now, names)
+        return names
+
+    def _llm_param_notice(self, message: str, *args: Any) -> None:
+        """LLM 参数类告警：每次会话只警告一次，避免高频群里刷屏。"""
+        if self._llm_notice_reported:
+            self._debug(message, *args)
+            return
+        self._llm_notice_reported = True
+        self.ctx.logger.warning(message, *args)
+
+    def _resolve_llm_params(self) -> tuple[str, str]:
+        """解析本次要传出的 (任务名, 具体模型名)，被停用的参数在此落空。"""
+        summarize = self.config.summarize
+        task = (summarize.task or "").strip() or "replyer"
+        model = (summarize.model or "").strip()
+        if self._llm_ignore_task:
+            task = ""
+        if self._llm_ignore_model:
+            model = ""
+        return task, model
+
+    async def _precheck_llm_model(self, model: str) -> str:
+        """调用前纠偏：``model`` 槽位若填的其实是任务名，就丢掉它。
+
+        判定要**双重确认**——值在内置白名单里 **且** 在 Host 实际任务清单里：
+        只用白名单会误伤同名的真模型，只用 Host 清单又无法排除它是真模型名。
+        ``needs_task_list_lookup`` 的左侧短路保证默认配置（空值）与真模型名都不产生额外 RPC。
+        """
+        if not model or not needs_task_list_lookup(model):
+            return model
+
+        available = await self._available_task_names()
+        if not available or model not in available:
+            return model
+
+        self._llm_ignore_model = True
+        self._llm_param_notice(
+            "配置项 summarize.model 填的是任务名「%s」，已忽略该值；"
+            "任务名请填在 summarize.task，summarize.model 留空即可用任务默认模型",
+            model,
+        )
+        return ""
+
+    async def _handle_llm_failure(self, reason: str, kwargs: dict[str, Any]) -> None:
+        """LLM 软失败（``success=False``）的诊断与自愈。
+
+        「未找到名为 X 的模型」是**配置性**错误——重试不会自愈，所以第 1 次就把
+        *实际传出*的参数、Host 可用任务名清单和修复步骤一起打出来，不等重试累计。
+        """
+        head = f"LLM 返回失败（{describe_kwargs(kwargs)}）：{reason or '未知原因'}"
+        rejected = rejected_model_name(reason)
+
+        if rejected and kwargs.get("model") == rejected and not self._llm_ignore_model:
+            self._llm_ignore_model = True
+            available = await self._available_task_names()
+            self.ctx.logger.error(
+                "%s\n已停用 summarize.model（本次运行内不再传该参数）。修复建议：%s",
+                head,
+                explain_missing_model(rejected, available),
+            )
+            return
+
+        if rejected and kwargs.get("task_name") == rejected and not self._llm_ignore_task:
+            self._llm_ignore_task = True
+            available = await self._available_task_names()
+            self.ctx.logger.error(
+                "%s\n已停用 summarize.task（回落到 Host 默认任务）。修复建议：%s",
+                head,
+                explain_missing_model(rejected, available),
+            )
+            return
+
+        self.ctx.logger.warning("%s", head)
+
     async def _call_llm(self, prompt: str) -> str:
         """调用 LLM 生成总结，失败返回空字符串。
 
-        ``model`` 必须显式传任务名：留空时 Host 会使用 ``plugin.<插件ID>``
-        作为任务名，未配置则回退到 embedding 模型并持续报 400。
+        任务名与模型名分走 ``task_name`` / ``model`` 两个槽位（Host 1.2.5 起语义拆分）：
+        把任务名塞进 ``model`` 会得到「未找到名为 'utils' 的模型」。传参构造在
+        ``core/llm_params``，这里只管纠偏、日志与降级。
         """
         summarize = self.config.summarize
-        task = (summarize.task or "").strip() or "replyer"
+        task, model = self._resolve_llm_params()
+        model = await self._precheck_llm_model(model)
+
+        if self._llm_supports_task_name is None:
+            self._llm_supports_task_name = generate_supports_task_name(self.ctx.llm.generate)
+
+        kwargs, notices = build_llm_kwargs(
+            task=task,
+            model=model,
+            supports_task_name=self._llm_supports_task_name,
+            temperature=summarize.temperature,
+            max_tokens=summarize.max_tokens,
+            timeout_ms=max(10000, int(summarize.rpc_timeout_ms)),
+        )
+        for notice in notices:
+            self._llm_param_notice("%s", notice)
+        # 打**实际传出**的参数，而不是读配置：两者之间隔着纠偏与默认值注入。
+        self._debug("LLM 调用参数：%s", describe_kwargs(kwargs))
 
         try:
             result = await asyncio.wait_for(
-                self.ctx.llm.generate(
-                    prompt,
-                    model=task,
-                    temperature=summarize.temperature,
-                    max_tokens=summarize.max_tokens,
-                    timeout_ms=max(10000, int(summarize.rpc_timeout_ms)),
-                ),
+                self.ctx.llm.generate(prompt, **kwargs),
                 timeout=max(10.0, summarize.rpc_timeout_ms / 1000.0) + 5.0,
             )
         except asyncio.TimeoutError:
             self._last_error = "LLM 总结超时"
-            self.ctx.logger.warning("LLM 总结超时（任务名 %s）", task)
+            self.ctx.logger.warning("LLM 总结超时（%s）", describe_kwargs(kwargs))
             return ""
         except Exception as exc:
             self._last_error = f"LLM 调用异常：{exc}"
-            self.ctx.logger.warning("LLM 调用失败（任务名 %s）：%s", task, exc)
+            self.ctx.logger.warning("LLM 调用失败（%s）：%s", describe_kwargs(kwargs), exc)
             return ""
 
         if not isinstance(result, dict) or not result.get("success"):
@@ -500,7 +646,7 @@ class WebSearchPlugin(MaiBotPlugin):
             if isinstance(result, dict):
                 reason = str(result.get("error") or result.get("message") or "")
             self._last_error = f"LLM 返回失败：{reason or '未知原因'}"
-            self.ctx.logger.warning("LLM 返回失败（任务名 %s）：%s", task, reason)
+            await self._handle_llm_failure(reason, kwargs)
             return ""
 
         text = str(result.get("response") or "").strip()
@@ -885,6 +1031,12 @@ class WebSearchPlugin(MaiBotPlugin):
         del config_data
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
+        # 自愈状态必须复位：用户改完配置要立刻生效，否则被停用的参数会一直停用。
+        self._llm_ignore_model = False
+        self._llm_ignore_task = False
+        self._llm_notice_reported = False
+        self._llm_task_names_cache = None
+        self._llm_supports_task_name = None
         await self._rebuild_runtime()
         self.ctx.logger.info("联网搜索插件配置已更新：version=%s", version)
 
@@ -1174,17 +1326,16 @@ class WebSearchPlugin(MaiBotPlugin):
         """渲染插件状态。
 
         会顺带拉一次宿主可用的模型任务名——总结任务名配错是本插件最容易踩的坑
-        （配错会回退到 embedding 模型并持续报 400），把可用值直接列出来最省事。
+        （配错会回退到 embedding 模型并持续报 400；把任务名填进模型名槽位则会
+        报「未找到名为 'xxx' 的模型」），把可用值直接列出来最省事。
         """
         chain = self._ensure_chain()
         cache_stats = self._cache.stats() if self._cache else None
         uptime = int(time.time() - self._started_at) if self._started_at else 0
 
-        available_models: list[str] = []
-        try:
-            available_models = [str(name) for name in await self.ctx.llm.get_available_models()]
-        except Exception as exc:  # 拿不到列表不影响其它诊断信息
-            self._debug("获取模型任务名失败：%s", exc)
+        # 诊断要的是此刻的真相，所以绕过缓存直接拉（内部仍有超时保护）。
+        self._llm_task_names_cache = None
+        available_models = await self._available_task_names()
 
         lines = [
             f"联网搜索插件 v{SUPPORTED_CONFIG_VERSION}",
@@ -1193,7 +1344,8 @@ class WebSearchPlugin(MaiBotPlugin):
             f"（最多尝试 {chain.max_attempts} 个）",
             f"抓取正文：{'开' if self.config.fetch.enabled else '关'}"
             f"（前 {self.config.fetch.max_pages} 条，每页 {self.config.fetch.per_page_chars} 字）",
-            f"总结模型任务：{self.config.summarize.task or '(空，会回退到 embedding！)'}"
+            f"总结任务：{self.config.summarize.task or '(空，会回退到 embedding！)'}"
+            f" / 具体模型：{self.config.summarize.model or '(跟随任务默认)'}"
             f"（{'开' if self.config.summarize.enabled else '关'}）",
             f"缓存：{'开' if cache_stats else '关'}",
             f"图片搜索：{'开' if self.config.image.enabled else '关'}"
@@ -1223,13 +1375,37 @@ class WebSearchPlugin(MaiBotPlugin):
 
         if available_models:
             lines.append("可用模型任务名：" + " / ".join(available_models[:15]))
-            if self.config.summarize.task not in available_models:
+            task_name = (self.config.summarize.task or "").strip()
+            if task_name and task_name not in available_models:
                 lines.append(
-                    f"注意：总结任务「{self.config.summarize.task}」不在上面的列表里，"
+                    f"注意：总结任务「{task_name}」不在上面的列表里，"
                     "请从列表中选一个，否则总结会失败"
                 )
+            model_name = (self.config.summarize.model or "").strip()
+            if model_name and model_name in available_models:
+                lines.append(
+                    f"注意：summarize.model 填的「{model_name}」是任务名而非模型名，"
+                    "调用时会被自动忽略；任务名请填 summarize.task"
+                )
         else:
-            lines.append("可用模型任务名：(未取到，不影响搜索功能)")
+            lines.append(
+                "可用模型任务名：(未取到) 若总结持续失败，请到 WebUI 确认模型列表非空"
+                "——先保存提供商，再添加模型，最后把任务指向具体模型"
+            )
+
+        stopped = [
+            name
+            for name, flag in (
+                ("summarize.model", self._llm_ignore_model),
+                ("summarize.task", self._llm_ignore_task),
+            )
+            if flag
+        ]
+        if stopped:
+            lines.append(
+                "已停用的 LLM 参数：" + " / ".join(stopped)
+                + "（本次运行内不再传出；改完配置重载插件即恢复）"
+            )
 
         lines.append("可用引擎名：" + " / ".join(supported_engine_names()))
         return "\n".join(lines)
