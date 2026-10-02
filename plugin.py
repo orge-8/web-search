@@ -20,6 +20,7 @@
 
 import asyncio
 import hashlib
+import logging
 import re
 import time
 from datetime import datetime
@@ -272,6 +273,20 @@ class WebSearchPlugin(MaiBotPlugin):
     """
 
     config_model: ClassVar[type[PluginConfigBase] | None] = WebSearchConfig
+
+    def get_webui_config_schema(self, **kwargs) -> dict:
+        """覆写 SDK 的 WebUI 配置 Schema：做可视化模式的显示层补丁。
+
+        Runner 调这个方法拿配置页 Schema 且异常会被吞掉（变成空 Schema、
+        配置页整页空白），所以这里自己兜底：补丁失败就原样返回 SDK 输出。
+        """
+
+        schema = super().get_webui_config_schema(**kwargs)
+        try:
+            return _apply_webui_display_polish(schema)
+        except Exception:  # noqa: BLE001 —— 显示补丁失败绝不能让配置页变空白
+            logging.getLogger(__name__).exception("修正 WebUI 配置 Schema 失败，回退 SDK 原样输出")
+            return schema
 
     def __init__(self) -> None:
         """初始化插件状态。"""
@@ -1477,6 +1492,93 @@ class WebSearchPlugin(MaiBotPlugin):
                 "每次搜索都会先等它超时一次（失败后 5 分钟内会被自动跳过）。"
             )
         return "\n".join(lines)
+
+
+# ================================================================ WebUI 显示层补丁
+#
+# 可视化模式的 FieldRenderer（dashboard/src/routes/plugin-config.tsx:163-361，
+# 1.3.1 布局）按 ui_type 渲染控件时只输出 label / hint / placeholder，
+# **从不渲染 description**；本插件字段的填法说明都写在 description 里，
+# 不搬进 hint，用户在配置页上一个字都看不到（源代码模式才见得到）。
+# 这里只改展示元数据，不碰任何配置键与校验语义。
+
+#: 默认收起的 section：标题自带「可选 / 默认关闭」的功能节。收起后标题
+#: 与说明仍可见，点开即可配置，避免整页卡片全开淹没常用配置。
+_WEBUI_COLLAPSED_SECTIONS: frozenset = frozenset({})
+
+#: 手工指定的 section 标题（键 = section 名）；仅在 SDK 输出标题等于
+#: 节名（未配置 __ui_label__）时采用。
+_WEBUI_SECTION_TITLES: dict = {}
+
+#: 手工指定的字段 label（键 = 字段名）；仅在自动推导不可用时采用。
+_WEBUI_LABEL_OVERRIDES: dict = {
+    "tavily_api_key": "Tavily API Key",
+    "model": "总结模型",
+}
+
+
+#: 推导 label 用的中文分隔符（取最靠左的一个）
+_WEBUI_CJK_SEPS = "。！？；，：（(、"
+
+
+def _webui_label_from_description(description: str) -> str:
+    """从中文 description 里取第一小句当显示标题（取不到返回空串）。
+
+    在中英文标点里找**最靠左**的分隔符，取它前面的短语——通常是字段
+    本身的名字；超长时截到 12 字符并避免把英文单词截一半。
+    """
+    text = (description or "").strip()
+    if not text:
+        return ""
+    cut = len(text)
+    for sep in _WEBUI_CJK_SEPS:
+        idx = text.find(sep)
+        if 0 < idx < cut:
+            cut = idx
+    text = text[:cut].strip()
+    if len(text) > 12:
+        text = text[:12]
+        if " " in text[4:]:
+            text = text[: text.rfind(" ")].rstrip() or text
+    while text and text[-1] in "（(\"“：:，,；;、":
+        text = text[:-1].rstrip()
+    return text if len(text) >= 2 else ""
+
+
+def _apply_webui_display_polish(schema: dict) -> dict:
+    """把 description 抄进 hint、补中文 label / 节标题、收起可选功能节。"""
+    if not isinstance(schema, dict):
+        return schema
+    sections = schema.get("sections")
+    if not isinstance(sections, dict):
+        return schema
+    for name, section in sections.items():
+        if not isinstance(section, dict):
+            continue
+        if name in _WEBUI_COLLAPSED_SECTIONS:
+            section["collapsed"] = True
+        title = section.get("title")
+        if not title or title == name:
+            new_title = _WEBUI_SECTION_TITLES.get(name) or _webui_label_from_description(
+                section.get("description") or ""
+            )
+            if new_title and new_title != name:
+                section["title"] = new_title
+        for fname, field in (section.get("fields") or {}).items():
+            if not isinstance(field, dict):
+                continue
+            if fname == "config_version":
+                field["hidden"] = True  # 插件自维护字段：可视化模式不渲染，源代码模式仍可见
+            if not field.get("hint") and field.get("description"):
+                field["hint"] = field["description"]
+            label = field.get("label")
+            if (not label or label == fname) and field.get("description"):
+                new_label = _WEBUI_LABEL_OVERRIDES.get(fname) or _webui_label_from_description(
+                    field["description"]
+                )
+                if new_label and new_label != fname:
+                    field["label"] = new_label
+    return schema
 
 
 def create_plugin() -> WebSearchPlugin:
